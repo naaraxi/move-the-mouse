@@ -19,10 +19,10 @@ date/time, and it only moves the mouse during that window, then stops on its own
   the window. A status line shows the current state (Ready / Scheduled / Active).
 
 ## Download
-Grab `MoveTheMouse-x64.exe` (or `-x86.exe`) from the latest **Actions** run
-(Actions -> latest build -> Artifacts). It's a single, portable executable - no
-installer. Because it's unsigned, Windows SmartScreen may warn on first run
-(More info -> Run anyway).
+Grab `MoveTheMouse-x64.exe` (or `-x86.exe`) from the [latest release](../../releases/latest)
+- it's rebuilt and re-published automatically on every change. Single portable
+executable, no installer. Because it's unsigned, Windows SmartScreen may warn on
+first run (More info -> Run anyway).
 
 ## Build
 Open `WindowsProject1.sln` in **Visual Studio 2022** (with the *Desktop

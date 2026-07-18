@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -35,3 +38,29 @@ jobs:
           name: MoveTheMouse-${{ matrix.platform }}
           path: dist/MoveTheMouse-${{ matrix.platform }}.exe
           if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish a release from the default branch, not from other branches/PRs.
+    if: github.ref == 'refs/heads/master'
+    steps:
+      - name: Download built exes
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish rolling "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: |
+            Automatic build of the latest `master` (commit ${{ github.sha }}).
+
+            - `MoveTheMouse-x64.exe` - 64-bit
+            - `MoveTheMouse-x86.exe` - 32-bit
+
+            Unsigned - Windows SmartScreen may warn on first run (More info -> Run anyway).
+          files: artifacts/**/*.exe
+          fail_on_unmatched_files: true
