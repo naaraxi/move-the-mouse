@@ -1,4 +1,6 @@
 #pragma comment(lib, "Comctl32.lib")
+// Pull in the v6 common controls so the calendar / edit controls are themed.
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include "WindowsProject1.h"
 #include <windows.h>
@@ -10,10 +12,9 @@
 #include <functional>
 
 // Constants
-constexpr int MAX_LOADSTRING = 100;
 constexpr int WINDOW_WIDTH = 400;
 constexpr int WINDOW_HEIGHT = 550;
-constexpr int MOUSE_MOVE_INTERVAL_MS = 5;
+constexpr int MOUSE_MOVE_INTERVAL_MS = 30;   // WM_TIMER can't do 5ms (~15ms floor); phase length is clock-based
 constexpr int MOUSE_MOVE_DURATION_MS = 5000;
 constexpr int MOUSE_PAUSE_DURATION_MS = 5000;
 constexpr int CHECK_TIME_INTERVAL_MS = 1000;
@@ -32,8 +33,10 @@ struct AppState {
     HWND hWndStatusText;
     std::chrono::system_clock::time_point startTime;
     std::chrono::system_clock::time_point endTime;
-    bool isMoving;
-    int elapsedTime;
+    bool armed;                                        // Start pressed: scheduled or running
+    bool isMoving;                                     // inside the active (start..end) window
+    bool inMovePhase;                                  // within active window: jiggling vs. pausing
+    std::chrono::steady_clock::time_point phaseStart;  // when the current move/pause phase began
     std::mt19937 randomGenerator;
 };
 
@@ -71,19 +74,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     // Initialize application state
     g_appState = std::make_unique<AppState>();
     g_appState->hInstance = hInstance;
+    g_appState->armed = false;
     g_appState->isMoving = false;
-    g_appState->elapsedTime = 0;
+    g_appState->inMovePhase = false;
 
     // Initialize random number generator
     std::random_device rd;
     g_appState->randomGenerator = std::mt19937(rd());
 
     // Register window class
-    WCHAR szTitle[MAX_LOADSTRING];
-    WCHAR szWindowClass[MAX_LOADSTRING];
-    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-    LoadStringW(hInstance, IDC_WINDOWSPROJECT1, szWindowClass, MAX_LOADSTRING);
-
     if (!RegisterMainWindowClass(hInstance)) {
         MessageBox(NULL, L"Window Registration Failed!", L"Error", MB_ICONEXCLAMATION | MB_OK);
         return 1;
@@ -113,10 +112,12 @@ ATOM RegisterMainWindowClass(HINSTANCE hInstance)
     wcex.style = CS_HREDRAW | CS_VREDRAW;
     wcex.lpfnWndProc = WndProc;
     wcex.hInstance = hInstance;
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_WINDOWSPROJECT1));
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
     // Change from COLOR_WINDOW+1 to COLOR_BTNFACE
     wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wcex.lpszClassName = L"MouseMoverWindowClass";
+    wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
 
     return RegisterClassExW(&wcex);
 }
@@ -271,15 +272,21 @@ void StartMouseMover()
     );
 
     // Validate time range
-    auto now = std::chrono::system_clock::now();
     if (g_appState->endTime <= g_appState->startTime) {
         MessageBox(g_appState->hMainWindow,
             L"End time must be after start time",
             L"Invalid Time Range", MB_OK | MB_ICONERROR);
         return;
     }
+    if (g_appState->endTime <= std::chrono::system_clock::now()) {
+        MessageBox(g_appState->hMainWindow,
+            L"End time is in the past - nothing to schedule.",
+            L"Invalid Time Range", MB_OK | MB_ICONERROR);
+        return;
+    }
 
-    // Update UI
+    // Arm and update UI
+    g_appState->armed = true;
     SetWindowText(g_appState->hWndStartButton, L"Stop Mouse Mover");
     UpdateStatusText(L"Scheduled - Waiting for start time");
 
@@ -295,8 +302,9 @@ void StopMouseMover()
     KillTimer(g_appState->hMainWindow, IDT_TIMER_MOVE);
 
     // Update state
+    g_appState->armed = false;
     g_appState->isMoving = false;
-    g_appState->elapsedTime = 0;
+    g_appState->inMovePhase = false;
 
     // Update UI
     SetWindowText(g_appState->hWndStartButton, L"Start Mouse Mover");
@@ -366,6 +374,23 @@ void MoveMouseRandomly()
         moveY = large_distr(g_appState->randomGenerator);
     }
 
+    // Keep the cursor on the primary screen: clamp the target and send the
+    // clamped delta, so repeated relative moves can't drift into a corner.
+    POINT pt;
+    if (GetCursorPos(&pt)) {
+        constexpr int margin = 4;
+        const int screenW = GetSystemMetrics(SM_CXSCREEN);
+        const int screenH = GetSystemMetrics(SM_CYSCREEN);
+        int targetX = pt.x + moveX;
+        int targetY = pt.y + moveY;
+        if (targetX < margin) targetX = margin;
+        if (targetY < margin) targetY = margin;
+        if (targetX > screenW - 1 - margin) targetX = screenW - 1 - margin;
+        if (targetY > screenH - 1 - margin) targetY = screenH - 1 - margin;
+        moveX = targetX - pt.x;
+        moveY = targetY - pt.y;
+    }
+
     // Create and send mouse input
     INPUT input = {};
     input.type = INPUT_MOUSE;
@@ -406,7 +431,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 PostMessage(hWnd, WM_CLOSE, 0, 0);
                 break;
             case ID_BUTTON_MOVE:
-                if (!g_appState->isMoving) {
+                if (!g_appState->armed) {
                     StartMouseMover();
                 }
                 else {
@@ -420,42 +445,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (wParam == IDT_TIMER_CHECK) {
             auto now = std::chrono::system_clock::now();
 
-            // Check if we should start moving
+            // Enter the active window: begin jiggling.
             if (now >= g_appState->startTime && now < g_appState->endTime) {
                 if (!g_appState->isMoving) {
                     g_appState->isMoving = true;
-                    g_appState->elapsedTime = 0;
+                    g_appState->inMovePhase = true;
+                    g_appState->phaseStart = std::chrono::steady_clock::now();
                     UpdateStatusText(L"Active - Moving mouse");
                     SetTimer(hWnd, IDT_TIMER_MOVE, MOUSE_MOVE_INTERVAL_MS, NULL);
                 }
             }
-            // Check if we should stop
+            // Past the end time: stop.
             else if (now >= g_appState->endTime) {
                 StopMouseMover();
             }
         }
         else if (wParam == IDT_TIMER_MOVE) {
-            // Check if we should stop
-            auto now = std::chrono::system_clock::now();
-            if (now >= g_appState->endTime) {
+            // Stop as soon as the scheduled end time passes.
+            if (std::chrono::system_clock::now() >= g_appState->endTime) {
                 StopMouseMover();
                 return 0;
             }
 
-            // Move mouse or pause based on elapsed time
-            g_appState->elapsedTime += MOUSE_MOVE_INTERVAL_MS;
-
-            if (g_appState->elapsedTime < MOUSE_MOVE_DURATION_MS) {
-                // Move the mouse
-                MoveMouseRandomly();
+            // Drive the move/pause cycle off a monotonic clock, so the phase
+            // durations are accurate regardless of the timer's real resolution.
+            auto elapsed = std::chrono::steady_clock::now() - g_appState->phaseStart;
+            if (g_appState->inMovePhase) {
+                if (elapsed < std::chrono::milliseconds(MOUSE_MOVE_DURATION_MS)) {
+                    MoveMouseRandomly();
+                }
+                else {
+                    g_appState->inMovePhase = false;
+                    g_appState->phaseStart = std::chrono::steady_clock::now();
+                    UpdateStatusText(L"Active - Pausing");
+                }
             }
-            else if (g_appState->elapsedTime == MOUSE_MOVE_DURATION_MS) {
-                // Switch to pause state
-                UpdateStatusText(L"Active - Pausing");
-            }
-            else if (g_appState->elapsedTime >= MOUSE_MOVE_DURATION_MS + MOUSE_PAUSE_DURATION_MS) {
-                // Reset cycle
-                g_appState->elapsedTime = 0;
+            else if (elapsed >= std::chrono::milliseconds(MOUSE_PAUSE_DURATION_MS)) {
+                g_appState->inMovePhase = true;
+                g_appState->phaseStart = std::chrono::steady_clock::now();
                 UpdateStatusText(L"Active - Moving mouse");
             }
         }
